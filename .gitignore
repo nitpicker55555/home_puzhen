@@ -1,0 +1,8 @@
+# Compiled app / build artifacts
+PuzhenVoiceAssistant/build/
+
+# Secrets — never commit the real key
+.env
+
+# macOS
+.DS_Store
