@@ -627,7 +627,10 @@ final class VoiceAssistant: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayer
         let elapsed = Date().timeIntervalSince(stateEnteredAt)
         switch state {
         case .thinking:
-            if elapsed > 200 { recover("thinking 卡了 \(Int(elapsed))s") }  // codex 可达180s
+            // Simple turns are fast (each API call now caps at 60s); 思考模式 may
+            // run Codex (~180s) so it needs more headroom.
+            let limit: TimeInterval = thinkingMode ? 360 : 90
+            if elapsed > limit { recover("thinking 卡了 \(Int(elapsed))s") }
         case .speaking:
             if elapsed > 60 { recover("speaking 卡了 \(Int(elapsed))s") }   // 单条回答不该超过60s
         case .capturing:
@@ -682,13 +685,15 @@ final class VoiceAssistant: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayer
         setState(.listening)
         // Periodically refresh the task so the transcript never grows unbounded
         // and we stay under any server-side time limit.
+        // Refresh the recognition session occasionally so the transcript can't
+        // grow unbounded. Kept infrequent (3 min) and SILENT: restarting too
+        // often creates a brief gap that can clip a wake word, and it spammed
+        // the log. On-device recognition also self-ends on silence (handleTaskEnd
+        // restarts then), so this is just a long-idle backstop.
         wakeRestartTimer?.invalidate()
-        wakeRestartTimer = Timer.scheduledTimer(withTimeInterval: 40, repeats: false) { [weak self] _ in
+        wakeRestartTimer = Timer.scheduledTimer(withTimeInterval: 180, repeats: false) { [weak self] _ in
             guard let self = self else { return }
-            if self.state == .listening && !self.triggered {
-                logLine("🔄 40s 定时刷新监听会话")
-                self._startListening()
-            }
+            if self.state == .listening && !self.triggered { self._startListening() }
         }
     }
 
@@ -1174,7 +1179,7 @@ final class VoiceAssistant: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayer
         guard let url = URL(string: Config.baseURL + "/chat/completions") else { return nil }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
-        req.timeoutInterval = 180
+        req.timeoutInterval = 60   // a voice turn should never take this long; fail fast and recover
         req.setValue("Bearer \(Config.apiKey)", forHTTPHeaderField: "Authorization")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         do {
