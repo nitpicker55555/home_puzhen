@@ -71,7 +71,12 @@ echo "ASSISTANT_MODEL=gemini-2.5-flash" >> .env && ./run.sh
 | `AIHUBMIX_API_KEY` | 无（必填） | AiHubMix 的 key，放在 `.env` 里 |
 | `ASSISTANT_MODEL` | `gpt-4.1-nano` | 大模型。可选 `gemini-2.5-flash` / `gpt-4o-mini` / `qwen-turbo` / `deepseek-chat` |
 | `ASSISTANT_LOCALE` | `zh-CN` | 语音识别语言。主要说英文就设 `en-US` |
-| `ASSISTANT_VOICE` | 自动 | 强制朗读语音，如 `zh-CN` 或 `en-US`；留空则按内容自动选 |
+| `ASSISTANT_TTS` | `api` | 朗读引擎：`api` = OpenAI 人声（自然，约 1 分钱/句，失败自动回退）；`system` = 系统自带（免费离线） |
+| `ASSISTANT_TTS_MODEL` | `gpt-4o-mini-tts` | API 人声模型 |
+| `ASSISTANT_TTS_VOICE` | `nova` | API 人声：`nova` / `coral` / `sage` / `shimmer` / `alloy` / `ash` / `onyx` / `echo` |
+| `ASSISTANT_TTS_INSTRUCTIONS` | 内置 | 声音风格提示词（仅 gpt-4o-mini-tts 支持） |
+| `ASSISTANT_RATE` | `1.0` | 语速倍率 |
+| `ASSISTANT_VOICE` | 自动 | 系统声音语言强制，如 `zh-CN`（仅 system 模式） |
 | `AIHUBMIX_BASE_URL` | `https://aihubmix.com/v1` | 接口地址 |
 
 ## 六、唤醒词识别不准怎么办
