@@ -40,6 +40,7 @@ func containsCJK(_ s: String) -> Bool {
 let logDir = ("~/Library/Logs" as NSString).expandingTildeInPath
 let debugLogPath = logDir + "/PuzhenAssistant.log"
 let chatLogPath  = logDir + "/PuzhenAssistant-chat.jsonl"
+let usageLogPath = logDir + "/PuzhenAssistant-usage.jsonl"
 let logLock = NSLock()
 let logDateFormatter: DateFormatter = {
     let f = DateFormatter()
@@ -64,6 +65,26 @@ func logLine(_ s: String) {
     let line = "[\(logDateFormatter.string(from: Date()))] \(s)\n"
     FileHandle.standardError.write(Data(line.utf8))
     appendToFile(debugLogPath, line)
+}
+
+/// Logs exact token usage + cost from an API response, and appends to the usage
+/// ledger so the real running total can be summed anytime. gpt-audio pricing:
+/// text-in $2.5, audio-in $32, text-out $10, audio-out $64 per 1M tokens.
+func logUsage(_ model: String, _ resp: [String: Any]) {
+    guard let u = resp["usage"] as? [String: Any] else { return }
+    let pt = (u["prompt_tokens"] as? Int) ?? 0
+    let ct = (u["completion_tokens"] as? Int) ?? 0
+    let ain = ((u["prompt_tokens_details"] as? [String: Any])?["audio_tokens"] as? Int) ?? 0
+    let aout = ((u["completion_tokens_details"] as? [String: Any])?["audio_tokens"] as? Int) ?? 0
+    let tin = max(0, pt - ain), tout = max(0, ct - aout)
+    let usd = Double(tin) * 2.5e-6 + Double(ain) * 32e-6 + Double(tout) * 10e-6 + Double(aout) * 64e-6
+    logLine(String(format: "💰 %@ 文入%d 音入%d 文出%d 音出%d → $%.5f (¥%.4f)", model, tin, ain, tout, aout, usd, usd * 7.2))
+    let obj: [String: Any] = ["time": logDateFormatter.string(from: Date()), "model": model,
+                              "tin": tin, "ain": ain, "tout": tout, "aout": aout, "usd": usd]
+    logLock.lock(); defer { logLock.unlock() }
+    if let d = try? JSONSerialization.data(withJSONObject: obj), let s = String(data: d, encoding: .utf8) {
+        appendToFile(usageLogPath, s + "\n")
+    }
 }
 
 /// Writes one conversation turn to the clean JSONL transcript.
@@ -141,11 +162,11 @@ enum Config {
     static let ttsInstructions = env("ASSISTANT_TTS_INSTRUCTIONS",
         "你是一个亲切的中文语音助手，说话自然、温柔、口语化，语速适中。")
 
-    // ---- Voice-native chat (speech in -> speech out, one model) ----
-    // "audio" = your recorded voice goes straight to a speech-native model
-    // which replies in its own natural voice (and can use tools).
-    // "text"  = the old pipeline (Apple STT text -> chat model -> TTS).
-    static let chatMode   = env("ASSISTANT_CHAT", "audio")
+    // ---- Chat mode ----
+    // "text"  = fast text model (Config.model, with tools); the answer is shown
+    //           as TEXT + a notification sound. No API voice — fast and cheap.
+    // "audio" = speech-native model (gpt-audio) that replies in a natural voice.
+    static let chatMode   = env("ASSISTANT_CHAT", "text")
     static let audioModel = env("ASSISTANT_AUDIO_MODEL", "gpt-audio-1.5")
     static let audioVoice = env("ASSISTANT_AUDIO_VOICE", "marin")
 
@@ -162,6 +183,12 @@ enum Config {
 
     // Playback rate for the voice replies (client-side, pitch-preserving).
     static let replyRate = Float(env("ASSISTANT_REPLY_RATE", "1.0")) ?? 1.0
+
+    // Built-in sounds (no API): startup "ready" chime and the wake "叮".
+    // Any name from /System/Library/Sounds: Glass/Hero/Blow/Submarine/Ping/Tink...
+    static let startupSound = env("ASSISTANT_STARTUP_SOUND", "Glass")
+    static let wakeSound    = env("ASSISTANT_WAKE_SOUND", "Ping")
+    static let resultSound  = env("ASSISTANT_RESULT_SOUND", "Tink")  // 文字答案就绪提示音
 
     // ---- Home Assistant (smart home control) ----
     static let haURL   = env("HA_URL", "http://localhost:8123")
@@ -234,6 +261,14 @@ let haDeviceCatalog = """
 🌡️传感器(用home_read读): 客厅温度 客厅湿度 卧室温度 卧室湿度 天气
 """
 
+/// True if the text is a short "let me check…" narration with no concrete info —
+/// weak models sometimes emit this instead of actually calling the tool.
+func looksLikeStall(_ s: String) -> Bool {
+    let stalls = ["稍等", "查一下", "我帮你查", "我来查", "让我查", "让我看", "马上", "这就",
+                  "正在查", "帮你看看", "帮您查", "我看看", "帮你查询"]
+    return s.count < 40 && !s.contains(where: { $0.isNumber }) && stalls.contains { s.contains($0) }
+}
+
 /// System prompt with live date/time, home-control catalog, and (optionally)
 /// the local-data tools. `thinking` controls whether Codex may be used.
 func buildSystemPrompt(includeTools: Bool = true, thinking: Bool = false) -> String {
@@ -270,6 +305,8 @@ func buildSystemPrompt(includeTools: Bool = true, thinking: Bool = false) -> Str
     }
     p += """
 
+    ⚠️ 重要：需要查询或控制设备/数据时，你必须【直接调用对应工具】去完成，\
+    绝对不要只回复“我帮你查一下”“请稍等”“马上看看”这类话却不发起工具调用——那样用户什么也拿不到。
     闲聊和常识问题不要用工具。用户的活动记录（JSONL）有两份,都可检索：
     1) 这台 Mac: \(Config.recordsFile)（2025年7月至今,10万行+）
     2) 旧 MacBook Air: \(Config.recordsAirFile)（2025年7月~2026年5月16日,更早历史查这份）
@@ -605,12 +642,13 @@ final class VoiceAssistant: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayer
     }
 
     private func greet() {
-        let hello = "你好，我是普真语音助手，叫我「普真普真」就可以了。"
-        logChat("assistant", hello)
-        onLine?("assistant", hello)
-        resetResponse()
-        feedResponse(hello)
-        endResponse()
+        // No API call on launch — just a pleasant built-in chime to signal "ready",
+        // then start listening (after the chime so it isn't fed into recognition).
+        onLine?("assistant", "🔔 已就绪，说「普真普真」叫我～")
+        NSSound(named: NSSound.Name(Config.startupSound))?.play()
+        Timer.scheduledTimer(withTimeInterval: 1.0, repeats: false) { [weak self] _ in
+            self?.startListening()
+        }
     }
 
     // MARK: State + status bar
@@ -660,7 +698,7 @@ final class VoiceAssistant: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayer
     }
 
     private func playChime() {
-        NSSound(named: NSSound.Name("Ping"))?.play()
+        NSSound(named: NSSound.Name(Config.wakeSound))?.play()
     }
 
     // MARK: Listening / wake word
@@ -856,7 +894,7 @@ final class VoiceAssistant: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayer
         manualMode = manual
         setState(.capturing)
         playChime()
-        startWavCapture()
+        if audioMode { startWavCapture() }   // only needed for the voice-native model
         wakeRestartTimer?.invalidate(); wakeRestartTimer = nil
         currentQuery = manual ? "" : extractQueryAfterWake(initialTranscript)
         armMaxCaptureTimer()
@@ -902,8 +940,8 @@ final class VoiceAssistant: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayer
         guard state == .capturing else { return }
         invalidateCaptureTimers()
         let q = currentQuery.trimmingCharacters(in: .whitespacesAndNewlines)
-        pendingWav = finishWavCapture()
-        logLine("🎬 finalizeCapture: query=\"\(q)\" wav=\(pendingWav?.count ?? 0)字节 audioMode=\(audioMode)")
+        pendingWav = audioMode ? finishWavCapture() : nil
+        logLine("🎬 finalizeCapture: query=\"\(q)\" wav=\(pendingWav?.count ?? 0)字节 mode=\(audioMode ? "audio" : "text")")
         cancelTask()
         if q.isEmpty { pendingWav = nil; _startListening(); return }
         handleQuery(q)
@@ -938,7 +976,7 @@ final class VoiceAssistant: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayer
         if audioMode {
             Task { await self.audioChat(history: snapshot, query: q, wav: wav) }
         } else {
-            Task { await self.streamLLM(history: snapshot) }
+            Task { await self.textChat(history: snapshot) }
         }
     }
 
@@ -1053,6 +1091,115 @@ final class VoiceAssistant: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayer
         return defs
     }
 
+    /// Executes one tool call (shared by text and audio modes). Returns the
+    /// text output to feed back to the model.
+    private func executeTool(_ name: String, _ args: [String: Any]) async -> String {
+        switch name {
+        case "run_terminal":
+            guard let cmd = args["command"] as? String else { return "缺少 command 参数" }
+            logLine("🖥️ \(cmd)")
+            await MainActor.run { self.onLine?("assistant", "🖥️ \(cmd)") }
+            return await Self.runShell(cmd)
+        case "home_control":
+            guard let domain = args["domain"] as? String, let service = args["service"] as? String
+            else { return "缺少 domain/service 参数" }
+            let entity = args["entity_id"] ?? "all"
+            let data = (args["data"] as? [String: Any]) ?? [:]
+            logLine("🏠 \(domain).\(service) \(entity)")
+            await MainActor.run { self.onLine?("assistant", "🏠 \(domain).\(service) → \(entity)") }
+            return await Self.haControl(domain: domain, service: service, entity: entity, data: data)
+        case "home_read":
+            guard let e = args["entity_id"] as? String else { return "缺少 entity_id 参数" }
+            logLine("🏠 read \(e)")
+            return await Self.haRead(entity: e)
+        case "ask_codex":
+            guard let q = args["question"] as? String else { return "缺少 question 参数" }
+            logLine("🧠 codex: \(q)")
+            await MainActor.run { self.onLine?("assistant", "🧠 正在让 Codex 研究：\(q)") }
+            return await Self.runCodex(q)
+        default:
+            return "未知工具 \(name)"
+        }
+    }
+
+    // MARK: Text chat (fast model, tools, text answer + notification sound — no voice)
+
+    private func textChat(history: [[String: Any]]) async {
+        if Config.apiKey.isEmpty {
+            await MainActor.run { self.showResult("还没有配置 A P I 密钥，请在 .env 里设置。") }
+            return
+        }
+        let thinking = thinkingMode
+        let tools = toolDefs
+        logLine("💬→ textChat: model=\(Config.model) tools=\(tools.count) thinking=\(thinking) 历史\(history.count)条")
+        var msgs: [[String: Any]] = [["role": "system", "content": buildSystemPrompt(thinking: thinking)]]
+        msgs.append(contentsOf: history)
+        var produced: [[String: Any]] = []
+        var stallRetries = 0
+
+        for _ in 0..<6 {
+            var body: [String: Any] = ["model": Config.model, "messages": msgs, "temperature": 0.4]
+            if Config.toolsOn && !tools.isEmpty { body["tools"] = tools }
+
+            guard let resp = await Self.postChat(body),
+                  let choices = resp["choices"] as? [[String: Any]],
+                  let msg = choices.first?["message"] as? [String: Any] else {
+                await MainActor.run { self.showResult("抱歉，请求失败了。") }
+                return
+            }
+
+            // Safety net: nano models sometimes NARRATE intent ("我帮你查一下…请稍等")
+            // as plain text instead of calling the tool. Force an actual call.
+            if (msg["tool_calls"] as? [[String: Any]])?.isEmpty ?? true,
+               !tools.isEmpty, stallRetries < 2,
+               looksLikeStall((msg["content"] as? String) ?? "") {
+                stallRetries += 1
+                logLine("↻ 模型只说要做却没调工具,强制重试")
+                msgs.append(["role": "assistant", "content": (msg["content"] as? String) ?? ""])
+                msgs.append(["role": "user", "content": "请现在就直接调用工具去完成，不要只说“稍等/我帮你查”。"])
+                continue
+            }
+
+            if let calls = msg["tool_calls"] as? [[String: Any]], !calls.isEmpty {
+                var am: [String: Any] = ["role": "assistant", "tool_calls": calls]
+                am["content"] = (msg["content"] as? String) ?? ""
+                msgs.append(am); produced.append(am)
+                for c in calls {
+                    let id = (c["id"] as? String) ?? ""
+                    let fn = c["function"] as? [String: Any]
+                    let name = (fn?["name"] as? String) ?? ""
+                    let argStr = (fn?["arguments"] as? String) ?? "{}"
+                    let args = (argStr.data(using: .utf8)
+                        .flatMap { try? JSONSerialization.jsonObject(with: $0) }) as? [String: Any] ?? [:]
+                    let output = await executeTool(name, args)
+                    msgs.append(["role": "tool", "tool_call_id": id, "content": output])
+                    produced.append(["role": "tool", "tool_call_id": id, "content": String(output.prefix(800))])
+                }
+                continue
+            }
+
+            let text = (msg["content"] as? String) ?? ""
+            if !text.isEmpty { produced.append(["role": "assistant", "content": text]) }
+            let persist = produced
+            await MainActor.run {
+                self.messages.append(contentsOf: persist)
+                self.trimHistory()
+                self.showResult(text.isEmpty ? "（没有想到答案）" : text)
+            }
+            return
+        }
+        await MainActor.run { self.showResult("查询轮数太多，换个问法试试。") }
+    }
+
+    /// Shows a text answer in the window + a notification chime, then resumes.
+    private func showResult(_ text: String) {
+        logLine("🤖 \(text)")
+        logChat("assistant", text)
+        onLine?("assistant", text)
+        NSSound(named: NSSound.Name(Config.resultSound))?.play()
+        startListening()
+    }
+
     private func audioChat(history: [[String: Any]], query: String, wav: Data?) async {
         let thinking = thinkingMode
         let tools = toolDefs
@@ -1108,27 +1255,7 @@ final class VoiceAssistant: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayer
                     let argStr = (fn?["arguments"] as? String) ?? "{}"
                     let args = (argStr.data(using: .utf8)
                         .flatMap { try? JSONSerialization.jsonObject(with: $0) }) as? [String: Any] ?? [:]
-                    var output = "未知工具 \(name)"
-                    if name == "run_terminal", let cmd = args["command"] as? String {
-                        logLine("🖥️ \(cmd)")
-                        await MainActor.run { self.onLine?("assistant", "🖥️ \(cmd)") }
-                        output = await Self.runShell(cmd)
-                    } else if name == "home_control",
-                              let domain = args["domain"] as? String,
-                              let service = args["service"] as? String {
-                        let entity = args["entity_id"] ?? "all"
-                        let data = (args["data"] as? [String: Any]) ?? [:]
-                        logLine("🏠 \(domain).\(service) \(entity)")
-                        await MainActor.run { self.onLine?("assistant", "🏠 \(domain).\(service) → \(entity)") }
-                        output = await Self.haControl(domain: domain, service: service, entity: entity, data: data)
-                    } else if name == "home_read", let e = args["entity_id"] as? String {
-                        logLine("🏠 read \(e)")
-                        output = await Self.haRead(entity: e)
-                    } else if name == "ask_codex", let q = args["question"] as? String {
-                        logLine("🧠 codex: \(q)")
-                        await MainActor.run { self.onLine?("assistant", "🧠 正在让 Codex 研究：\(q)") }
-                        output = await Self.runCodex(q)
-                    }
+                    let output = await executeTool(name, args)
                     msgs.append(["role": "tool", "tool_call_id": id, "content": output])
                     produced.append(["role": "tool", "tool_call_id": id, "content": String(output.prefix(800))])
                 }
@@ -1190,7 +1317,9 @@ final class VoiceAssistant: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayer
                 logLine("❌ 语音对话 HTTP \(code)：\(String(data: data.prefix(300), encoding: .utf8) ?? "")")
                 return nil
             }
-            return (try JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            let j = (try JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            if let j = j { logUsage((body["model"] as? String) ?? "?", j) }
+            return j
         } catch {
             logLine("❌ 语音对话网络错误：\(error.localizedDescription)")
             return nil
